@@ -1,11 +1,11 @@
 #[macro_use]
 extern crate serde;
 use candid::{Decode, Encode};
-use ic_cdk::api::time;
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{BoundedStorable, Cell, DefaultMemoryImpl, StableBTreeMap, Storable};
 use std::{borrow::Cow, cell::RefCell};
 
+// Memory type aliases
 type Memory = VirtualMemory<DefaultMemoryImpl>;
 type IdCell = Cell<u64, Memory>;
 
@@ -54,7 +54,7 @@ struct SaleRecord {
 struct InventoryAdjustment {
     id: u64,
     liquor_product_id: u64,
-    quantity_changed: u64,
+    quantity_changed: i64, // Allows both positive and negative adjustments
     reason: String,
     adjusted_by: u64,
     adjustment_date: u64,
@@ -83,7 +83,7 @@ enum Message {
     AgeRestriction(String),
 }
 
-// Implementing Storable and BoundedStorable for each struct
+// Implementing Storable and BoundedStorable for structs
 impl Storable for User {
     fn to_bytes(&self) -> Cow<[u8]> {
         Cow::Owned(Encode!(self).unwrap())
@@ -196,21 +196,31 @@ thread_local! {
     );
 }
 
+// Function to generate a unique ID
+fn generate_id() -> u64 {
+    ID_COUNTER.with(|counter| {
+        let current_value = *counter.borrow().get();
+        counter.borrow_mut().set(current_value + 1).expect("Counter increment failed");
+        current_value
+    })
+}
+
+// Input validation function
+fn validate_string_field(field: &str, field_name: &str) -> Result<(), Message> {
+    if field.trim().is_empty() {
+        return Err(Message::InvalidPayload(format!("{} cannot be empty", field_name)));
+    }
+    Ok(())
+}
+
 // Function to register a user
 #[ic_cdk::update]
 fn register_user(username: String, role: String, contact_info: String) -> Result<User, Message> {
-    if username.is_empty() || role.is_empty() || contact_info.is_empty() {
-        return Err(Message::InvalidPayload(
-            "Missing required fields".to_string(),
-        ));
-    }
+    validate_string_field(&username, "Username")?;
+    validate_string_field(&role, "Role")?;
+    validate_string_field(&contact_info, "Contact Info")?;
 
-    let user_id = ID_COUNTER
-        .with(|counter| {
-            let current_value = *counter.borrow().get();
-            counter.borrow_mut().set(current_value + 1)
-        })
-        .expect("Counter increment failed");
+    let user_id = generate_id();
 
     let user = User {
         id: user_id,
@@ -225,6 +235,50 @@ fn register_user(username: String, role: String, contact_info: String) -> Result
     });
 
     Ok(user)
+}
+
+// Additional Function: Check stock availability
+#[ic_cdk::query]
+fn check_stock_availability(product_id: u64) -> Result<u64, Message> {
+    LIQUOR_PRODUCTS_STORAGE.with(|storage| {
+        storage
+            .borrow()
+            .get(&product_id)
+            .map(|product| product.current_stock)
+            .ok_or(Message::NotFound("Product not found".to_string()))
+    })
+}
+
+// Additional Function: List products below stock threshold
+#[ic_cdk::query]
+fn list_low_stock_products(threshold: u64) -> Vec<LiquorProduct> {
+    LIQUOR_PRODUCTS_STORAGE.with(|storage| {
+        storage
+            .borrow()
+            .iter()
+            .filter(|(_, product)| product.current_stock < threshold)
+            .map(|(_, product)| product.clone())
+            .collect()
+    })
+}
+
+// Additional Function: Generate sales report
+#[ic_cdk::query]
+fn generate_sales_report() -> Vec<(String, u64)> {
+    SALE_RECORDS_STORAGE.with(|sales_storage| {
+        let sales = sales_storage.borrow();
+        LIQUOR_PRODUCTS_STORAGE.with(|products_storage| {
+            let products = products_storage.borrow();
+            sales
+                .iter()
+                .filter_map(|(_, sale)| {
+                    products
+                        .get(&sale.liquor_product_id)
+                        .map(|product| (product.name.clone(), sale.total_price))
+                })
+                .collect()
+        })
+    })
 }
 
 // Function to search for a user by username
